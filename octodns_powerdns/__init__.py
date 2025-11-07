@@ -110,6 +110,7 @@ class PowerDnsBaseProvider(BaseProvider):
         soa_edit_api='default',
         mode_of_operation='master',
         notify=False,
+        skip_ds_records=False,
         *args,
         **kwargs,
     ):
@@ -128,7 +129,7 @@ class PowerDnsBaseProvider(BaseProvider):
         self.scheme = scheme
         self.timeout = timeout
         self.notify = notify
-
+        self.skip_ds_records = skip_ds_records
         self._powerdns_version = None
 
         sess = Session()
@@ -502,6 +503,10 @@ class PowerDnsBaseProvider(BaseProvider):
             for rrset in resp.json()['rrsets']:
                 _type = rrset['type']
                 _provider_specific_type = f'PowerDnsProvider/{_type}'
+
+                # Skip DS records if configured to do so
+                if self.skip_ds_records and _type == 'DS':
+                    continue
                 if (
                     _type not in self.SUPPORTS
                     and _provider_specific_type not in self.SUPPORTS
@@ -689,6 +694,12 @@ class PowerDnsBaseProvider(BaseProvider):
 
         mods = []
         for change in changes:
+            # Skip DS record changes if configured to do so
+            if self.skip_ds_records:
+                record = change.new if hasattr(change, 'new') else change.existing
+                if record and record._type == 'DS':
+                    self.log.debug('_apply: skipping DS record change for %s', record.fqdn)
+                    continue
             class_name = change.__class__.__name__
             mods.append(getattr(self, f'_mod_{class_name}')(change))
 
