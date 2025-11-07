@@ -2,7 +2,9 @@
 #
 #
 
+import json
 import logging
+import os
 from operator import itemgetter
 from urllib.parse import quote_plus
 
@@ -111,6 +113,7 @@ class PowerDnsBaseProvider(BaseProvider):
         mode_of_operation='master',
         notify=False,
         skip_delegation_records=False,
+        skipped_records_dir=None,
         *args,
         **kwargs,
     ):
@@ -130,6 +133,7 @@ class PowerDnsBaseProvider(BaseProvider):
         self.timeout = timeout
         self.notify = notify
         self.skip_delegation_records = skip_delegation_records
+        self.skipped_records_dir = skipped_records_dir
 
         self._powerdns_version = None
 
@@ -498,10 +502,27 @@ class PowerDnsBaseProvider(BaseProvider):
 
         before = len(zone.records)
         exists = False
+        skipped_records = []
 
         if resp:
             exists = True
-            for rrset in resp.json()['rrsets']:
+            rrsets = resp.json()['rrsets']
+
+            # First pass: identify delegated subdomains if skip_delegation_records is enabled
+            delegated_subdomains = set()
+            if self.skip_delegation_records:
+                for rrset in rrsets:
+                    if rrset['type'] == 'NS':
+                        record_name = zone.hostname_from_fqdn(rrset['name'])
+                        if record_name != '':
+                            delegated_subdomains.add(record_name)
+                            self.log.debug(
+                                'populate:   identified delegated subdomain: %s',
+                                record_name,
+                            )
+
+            # Second pass: process all records
+            for rrset in rrsets:
                 _type = rrset['type']
                 _provider_specific_type = f'PowerDnsProvider/{_type}'
                 if (
@@ -512,16 +533,36 @@ class PowerDnsBaseProvider(BaseProvider):
 
                 record_name = zone.hostname_from_fqdn(rrset['name'])
 
-                # Skip delegation records (NS and DS) if configured
-                if (
-                    self.skip_delegation_records
-                    and _type in ('NS', 'DS')
-                    and record_name != ''
-                ):
+                # Check if this record is under a delegated subdomain
+                is_delegated = False
+                if self.skip_delegation_records and delegated_subdomains:
+                    for delegated in delegated_subdomains:
+                        if record_name == delegated or record_name.endswith(
+                            f'.{delegated}'
+                        ):
+                            is_delegated = True
+                            break
+
+                # Skip records under delegated subdomains
+                if is_delegated:
                     self.log.debug(
-                        'populate:   skipping delegation %s record for %s',
+                        'populate:   skipping %s record for %s (under delegation)',
                         _type,
                         record_name,
+                    )
+                    # Track skipped record
+                    skipped_records.append(
+                        {
+                            'zone': zone.name,
+                            'name': record_name,
+                            'fqdn': rrset['name'],
+                            'type': _type,
+                            'ttl': rrset['ttl'],
+                            'records': [
+                                {'content': r['content'], 'disabled': r['disabled']}
+                                for r in rrset['records']
+                            ],
+                        }
                     )
                     continue
 
@@ -535,12 +576,58 @@ class PowerDnsBaseProvider(BaseProvider):
                 )
                 zone.add_record(record, lenient=lenient)
 
+            # Write skipped records to file if configured
+            if self.skip_delegation_records and skipped_records and self.skipped_records_dir:
+                self._write_skipped_records(zone.name, skipped_records)
+
         self.log.info(
             'populate:   found %s records, exists=%s',
             len(zone.records) - before,
             exists,
         )
         return exists
+
+    def _write_skipped_records(self, zone_name, skipped_records):
+        """Write skipped delegation records to a NetBox-compatible JSON file."""
+        try:
+            # Create output directory if it doesn't exist
+            os.makedirs(self.skipped_records_dir, exist_ok=True)
+
+            # Sanitize zone name for filename (remove trailing dot)
+            safe_zone_name = zone_name.rstrip('.')
+            filename = f'{safe_zone_name}_delegations.json'
+            filepath = os.path.join(self.skipped_records_dir, filename)
+
+            # Prepare NetBox-compatible format
+            # Flatten the records for easier NetBox import
+            netbox_records = []
+            for rec in skipped_records:
+                for content_rec in rec['records']:
+                    netbox_records.append(
+                        {
+                            'zone': rec['zone'],
+                            'name': rec['name'],
+                            'fqdn': rec['fqdn'],
+                            'type': rec['type'],
+                            'ttl': rec['ttl'],
+                            'value': content_rec['content'],
+                            'disabled': content_rec['disabled'],
+                        }
+                    )
+
+            # Write to JSON file
+            with open(filepath, 'w') as f:
+                json.dump(netbox_records, f, indent=2)
+
+            self.log.info(
+                '_write_skipped_records: wrote %d skipped records to %s',
+                len(netbox_records),
+                filepath,
+            )
+        except Exception as e:
+            self.log.error(
+                '_write_skipped_records: failed to write skipped records: %s', e
+            )
 
     def _records_for_multiple(self, record):
         return [
