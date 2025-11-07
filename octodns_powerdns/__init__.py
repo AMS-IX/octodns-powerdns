@@ -512,14 +512,15 @@ class PowerDnsBaseProvider(BaseProvider):
 
                 record_name = zone.hostname_from_fqdn(rrset['name'])
 
-                # Skip delegation NS records if configured
+                # Skip delegation records (NS and DS) if configured
                 if (
                     self.skip_delegation_records
-                    and _type == 'NS'
+                    and _type in ('NS', 'DS')
                     and record_name != ''
                 ):
                     self.log.debug(
-                        'populate:   skipping delegation NS record for %s',
+                        'populate:   skipping delegation %s record for %s',
+                        _type,
                         record_name,
                     )
                     continue
