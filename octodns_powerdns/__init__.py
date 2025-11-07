@@ -28,7 +28,6 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     SUPPORTS_URI = False
 
-
 from .record import PowerDnsLuaRecord
 
 # TODO: remove __VERSION__ with the next major version release
@@ -99,20 +98,20 @@ class PowerDnsBaseProvider(BaseProvider):
     POWERDNS_LEGACY_MODES_OF_OPERATION = {'native', 'master', 'slave'}
 
     def __init__(
-        self,
-        id,
-        host,
-        api_key,
-        port=8081,
-        scheme="http",
-        ssl_verify=True,
-        timeout=TIMEOUT,
-        soa_edit_api='default',
-        mode_of_operation='master',
-        notify=False,
-        skip_ds_records=False,
-        *args,
-        **kwargs,
+            self,
+            id,
+            host,
+            api_key,
+            port=8081,
+            scheme="http",
+            ssl_verify=True,
+            timeout=TIMEOUT,
+            soa_edit_api='default',
+            mode_of_operation='master',
+            notify=False,
+            skip_delegation_records=False,
+            *args,
+            **kwargs,
     ):
         super().__init__(id, *args, **kwargs)
 
@@ -129,8 +128,9 @@ class PowerDnsBaseProvider(BaseProvider):
         self.scheme = scheme
         self.timeout = timeout
         self.notify = notify
-        self.skip_ds_records = skip_ds_records
+        self.skip_delegation_records = skip_delegation_records
         self._powerdns_version = None
+        self._zones_cache = None
 
         sess = Session()
         sess.headers.update(
@@ -439,8 +439,8 @@ class PowerDnsBaseProvider(BaseProvider):
             # running an (much) older version we need to check against the
             # reduced set of options now that we can get the version
             if (
-                self.powerdns_version < [4, 5]
-                and value not in self.POWERDNS_LEGACY_MODES_OF_OPERATION
+                    self.powerdns_version < [4, 5]
+                    and value not in self.POWERDNS_LEGACY_MODES_OF_OPERATION
             ):
                 raise ValueError(
                     f'invalid mode_of_operation "{value}" - available values: {self.POWERDNS_LEGACY_MODES_OF_OPERATION}'
@@ -459,6 +459,32 @@ class PowerDnsBaseProvider(BaseProvider):
         self.log.debug('list_zones:')
         resp = self._get('zones')
         return sorted([z['name'] for z in resp.json()])
+
+    def _is_delegation_record(self, zone, record_name, record_type):
+        """
+        Check if a record is a delegation to a child zone.
+        Returns True if the record is a DS or NS record pointing to a child zone.
+        """
+        if record_type not in ('DS', 'NS'):
+            return False
+
+        if not self.skip_delegation_records:
+            return False
+
+        # Cache zones list if not already cached
+        if self._zones_cache is None:
+            self._zones_cache = set(self.list_zones())
+
+        # Build the potential child zone name
+        if record_name == '':
+            # Root record in the zone cannot be a delegation
+            return False
+
+        # Construct the FQDN of the potential child zone
+        child_zone_fqdn = f"{record_name}.{zone.name}" if record_name else zone.name
+
+        # Check if this child zone exists in our managed zones
+        return child_zone_fqdn in self._zones_cache
 
     def populate(self, zone, target=False, lenient=False):
         self.log.debug(
@@ -483,9 +509,9 @@ class PowerDnsBaseProvider(BaseProvider):
                 # untouched.
                 pass
             elif (
-                e.response.status_code == 422
-                and error.startswith('Could not find domain ')
-                and not self.check_status_not_found
+                    e.response.status_code == 422
+                    and error.startswith('Could not find domain ')
+                    and not self.check_status_not_found
             ):
                 # 422 means powerdns doesn't know anything about the requested
                 # domain. We'll just ignore it here and leave the zone
@@ -504,16 +530,23 @@ class PowerDnsBaseProvider(BaseProvider):
                 _type = rrset['type']
                 _provider_specific_type = f'PowerDnsProvider/{_type}'
 
-                # Skip DS records if configured to do so
-                if self.skip_ds_records and _type == 'DS':
-                    continue
                 if (
-                    _type not in self.SUPPORTS
-                    and _provider_specific_type not in self.SUPPORTS
+                        _type not in self.SUPPORTS
+                        and _provider_specific_type not in self.SUPPORTS
                 ):
                     continue
-                data_for = getattr(self, f'_data_for_{_type}')
                 record_name = zone.hostname_from_fqdn(rrset['name'])
+
+                # Skip DS and NS records if they are delegations to child zones
+                if self._is_delegation_record(zone, record_name, _type):
+                    self.log.debug(
+                        'populate: skipping delegation record %s %s (child zone exists)',
+                        record_name,
+                        _type
+                    )
+                    continue
+
+                data_for = getattr(self, f'_data_for_{_type}')
                 record = Record.new(
                     zone,
                     record_name,
@@ -579,20 +612,20 @@ class PowerDnsBaseProvider(BaseProvider):
         return [
             {
                 'content': '%d %d %0.3f %s %d %d %.3f %s %0.2fm %0.2fm %0.2fm %0.2fm'
-                % (
-                    int(v.lat_degrees),
-                    int(v.lat_minutes),
-                    float(v.lat_seconds),
-                    v.lat_direction,
-                    int(v.long_degrees),
-                    int(v.long_minutes),
-                    float(v.long_seconds),
-                    v.long_direction,
-                    float(v.altitude),
-                    float(v.size),
-                    float(v.precision_horz),
-                    float(v.precision_vert),
-                ),
+                           % (
+                               int(v.lat_degrees),
+                               int(v.lat_minutes),
+                               float(v.lat_seconds),
+                               v.lat_direction,
+                               int(v.long_degrees),
+                               int(v.long_minutes),
+                               float(v.long_seconds),
+                               v.long_direction,
+                               float(v.altitude),
+                               float(v.size),
+                               float(v.precision_horz),
+                               float(v.precision_vert),
+                           ),
                 'disabled': False,
             }
             for v in record.values
@@ -608,7 +641,7 @@ class PowerDnsBaseProvider(BaseProvider):
         return [
             {
                 'content': f'{v.order} {v.preference} "{v.flags}" "{v.service}" '
-                f'"{v.regexp}" {v.replacement}',
+                           f'"{v.regexp}" {v.replacement}',
                 'disabled': False,
             }
             for v in record.values
@@ -694,88 +727,93 @@ class PowerDnsBaseProvider(BaseProvider):
 
         mods = []
         for change in changes:
-            # Skip DS record changes if configured to do so
-            if self.skip_ds_records:
-                record = change.new if hasattr(change, 'new') else change.existing
-                if record and record._type == 'DS':
-                    self.log.debug('_apply: skipping DS record change for %s', record.fqdn)
-                    continue
-            class_name = change.__class__.__name__
-            mods.append(getattr(self, f'_mod_{class_name}')(change))
 
-        # Ensure that any DELETE modifications always occur before any REPLACE
-        # modifications. This ensures that an A record can be replaced by a
-        # CNAME record and vice-versa.
-        mods.sort(key=itemgetter('changetype'))
+            record = change.new if hasattr(change, 'new') else change.existing
+            if record and self._is_delegation_record(desired, record.name, record._type):
+                self.log.debug(
+                    '_apply: skipping delegation record change for %s %s (child zone exists)',
+                    record.fqdn,
+                    record._type
+                )
+                continue
 
-        self.log.debug('_apply:   sending change request')
+        class_name = change.__class__.__name__
+        mods.append(getattr(self, f'_mod_{class_name}')(change))
 
-        try:
-            self._patch(f'zones/{encoded_name}', data={'rrsets': mods})
-            self.log.debug('_apply:   patched')
-        except HTTPError as e:
-            error = self._get_error(e)
-            if not (
+    # Ensure that any DELETE modifications always occur before any REPLACE
+    # modifications. This ensures that an A record can be replaced by a
+    # CNAME record and vice-versa.
+    mods.sort(key=itemgetter('changetype'))
+
+    self.log.debug('_apply:   sending change request')
+
+    try:
+        self._patch(f'zones/{encoded_name}', data={'rrsets': mods})
+        self.log.debug('_apply:   patched')
+    except HTTPError as e:
+        error = self._get_error(e)
+        if not (
                 (e.response.status_code == 404 and self.check_status_not_found)
                 or (
-                    e.response.status_code == 422
-                    and error.startswith('Could not find domain ')
-                    and not self.check_status_not_found
+                        e.response.status_code == 422
+                        and error.startswith('Could not find domain ')
+                        and not self.check_status_not_found
                 )
-            ):
-                self.log.error(
-                    '_apply:   status=%d, text=%s',
-                    e.response.status_code,
-                    e.response.text,
-                )
-                raise
+        ):
+            self.log.error(
+                '_apply:   status=%d, text=%s',
+                e.response.status_code,
+                e.response.text,
+            )
+            raise
 
-            self.log.info('_apply:   creating zone=%s', desired.name)
-            # 404 or 422 means powerdns doesn't know anything about the
-            # requested domain. We'll try to create it with the correct
-            # records instead of update. Hopefully all the mods are
-            # creates :-)
-            data = {
-                'name': desired.name,
-                'kind': self.mode_of_operation,
-                'masters': [],
-                'nameservers': [],
-                'rrsets': mods,
-                'soa_edit_api': self.soa_edit_api,
-                'serial': 0,
-            }
-            try:
-                self._post('zones', data)
-            except HTTPError as e:
-                self.log.error(
-                    '_apply:   status=%d, text=%s',
-                    e.response.status_code,
-                    e.response.text,
-                )
-                raise
-            self.log.debug('_apply:   created')
+        self.log.info('_apply:   creating zone=%s', desired.name)
+        # 404 or 422 means powerdns doesn't know anything about the
+        # requested domain. We'll try to create it with the correct
+        # records instead of update. Hopefully all the mods are
+        # creates :-)
+        data = {
+            'name': desired.name,
+            'kind': self.mode_of_operation,
+            'masters': [],
+            'nameservers': [],
+            'rrsets': mods,
+            'soa_edit_api': self.soa_edit_api,
+            'serial': 0,
+        }
+        try:
+            self._post('zones', data)
+        except HTTPError as e:
+            self.log.error(
+                '_apply:   status=%d, text=%s',
+                e.response.status_code,
+                e.response.text,
+            )
+            raise
+        self.log.debug('_apply:   created')
 
-        if self.notify:
-            self._request_notify(encoded_name)
+    if self.notify:
+        self._request_notify(encoded_name)
 
-        self.log.debug('_apply:   complete')
+    self.log.debug('_apply:   complete')
 
-    def _request_notify(self, zoneid):
-        self.log.debug('_request_notify: requesting notification: %s', zoneid)
-        self._put(f'zones/{zoneid}/notify')
+
+def _request_notify(self, zoneid):
+    self.log.debug('_request_notify: requesting notification: %s', zoneid)
+    self._put(f'zones/{zoneid}/notify')
 
 
 class PowerDnsProvider(PowerDnsBaseProvider):
     def __init__(
-        self,
-        id,
-        host,
-        api_key,
-        port=8081,
-        nameserver_values=None,
-        nameserver_ttl=None,
-        *args,
-        **kwargs,
+            self,
+            id,
+            host,
+            api_key,
+            port=8081,
+            nameserver_values=None,
+            nameserver_ttl=None,
+            *args,
+            **kwargs,
     ):
         self.log = logging.getLogger(f'PowerDnsProvider[{id}]')
         self.log.debug(
